@@ -251,8 +251,18 @@ _SCHEMA_NAME_DESC   = "Filter by schema name. Comma-separated."
 _OBJECT_NAME_DESC   = "Filter by object/table name. Comma-separated."
 
 # =============================================================================
-# HEALTH CHECK
+# ROOT & HEALTH CHECK
 # =============================================================================
+
+@app.get("/", tags=["Health"], summary="API Root")
+def api_root():
+    """Root endpoint welcoming users and directing to docs."""
+    return {
+        "message": "VITHI Data Observability API is running",
+        "docs_url": "/docs",
+        "health_url": "/api/health",
+        "version": "3.0.0"
+    }
 
 @app.get("/api/health", tags=["Health"], summary="API & DB health check")
 def api_health():
