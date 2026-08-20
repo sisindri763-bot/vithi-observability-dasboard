@@ -1,0 +1,30 @@
+# Environment — NEVER commit real credentials
+.env
+.env.local
+
+# VS Code workspace settings (local only)
+.vscode/
+
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Logs
+*.log
+
+# Node (if added later)
+node_modules/
+
+# Test + dev tools — not needed on Vercel
+test_api.py
+tools/
+
+# OS files
+.DS_Store
+Thumbs.db
