@@ -1,46 +1,59 @@
 # VITHI Data Observability API
 
-Backend REST API for VITHI Data Observability Dashboard connected to AWS RDS MySQL (`webhooks_db`).
+Production-grade Data Observability Backend REST API connected to AWS RDS MySQL (`metadata` DB).
 
-## Features & Endpoints
+## Observability Calculation Specifications
+
+### 1. Incidents & Pipeline Failure States
+- **Active Incidents**: Evaluates the latest execution run per pipeline. A pipeline has an **OPEN** incident if its latest run is in `failed` or `error` state. When a subsequent run succeeds, the incident transitions to **RESOLVED**.
+- **Blast Radius**: Computed dynamically from downstream datasets registered in `obs_run_assets` with `asset_role = 'TARGET'`.
+
+### 2. SLA-Based Freshness
+- **Lag Metric**: `TIMESTAMPDIFF(MINUTE, last_updated_at, observed_at)`
+- **SLA Classification**:
+  - `Fresh`: $\text{lag} \le \text{SLA}$
+  - `Delayed`: $\text{SLA} < \text{lag} \le 2 \times \text{SLA}$
+  - `Stale`: $\text{lag} > 2 \times \text{SLA}$
+
+### 3. Cartesian-Safe Volume Telemetry
+- Source and target assets are aggregated into independent pre-aggregated CTEs per `run_id` to eliminate $M \times N$ Cartesian product skew.
+- Flags volume drop anomalies when $(\text{src\_rows} - \text{tgt\_rows}) / \text{src\_rows} > 15\%$.
+
+### 4. Temporal Schema Drift
+- Tracks schema migrations across consecutive runs (Run $N$ vs Run $N-1$) for each dataset in `obs_run_columns`, isolating added columns, dropped columns, and data type changes.
+
+### 5. Health Pillars & Zero Synthetic Assumptions
+- **Freshness**: $\frac{\text{fresh\_assets}}{\text{total\_assets}} \times 100$
+- **Volume**: $\frac{\text{normal\_runs}}{\text{total\_runs}} \times 100$
+- **Data Quality**: Query compilation & execution success rate from `obs_run_query_history`.
+- **Schema**: $\frac{\text{matching\_schema\_runs}}{\text{total\_runs}} \times 100$
+- **Consistency & Uniqueness**: Explicitly marked as `N/A` (`available: false`) until custom assertion test rules are configured, ensuring the dashboard never reports artificial scores.
+
+---
+
+## API Endpoints
+
+- **Root & Health:**
+  - `GET /` — API welcome & documentation catalog
+  - `GET /api/health` — Live database connectivity status
 
 - **Overview APIs:**
-  - `GET /api/health` — Health check
-  - `GET /api/overview/kpis` — Total pipelines, success rate, failed runs, average duration, active incidents
-  - `GET /api/overview/charts` — Pipeline runs over time, success rate over time, incidents over time
-  - `GET /api/overview/health` — Data Observability pillars (Volume, Freshness, Schema)
-  - `GET /api/overview/recent-incidents` — Incident log with severity breakdown
-  - `GET /api/overview/pipeline-monitoring` — Per-pipeline health & telemetry metrics
+  - `GET /api/overview/kpis` — Total pipelines, success rate, failed runs, avg latency, active incidents, period deltas
+  - `GET /api/overview/charts` — Stacked runs over time, success curve, incident severity series
+  - `GET /api/overview/health` — Observability pillar metrics & SLA scores
+  - `GET /api/overview/recent-incidents` — Incident log with blast radius & resolution state
+  - `GET /api/overview/pipeline-monitoring` — Pipeline health, runs, latency, and tools
 
 - **Pipeline Deep-Dive:**
-  - `GET /api/pipelines` — All unique pipelines
-  - `GET /api/pipelines/{pipeline_id}/runs` — Historical execution runs for a pipeline
+  - `GET /api/pipelines` — Registered pipelines
+  - `GET /api/pipelines/{pipeline_id}/runs` — Historical runs with linked assets
 
 - **Observability Deep-Dive:**
-  - `GET /api/observability/volume` — Source vs Target row count comparison & drop detection
-  - `GET /api/observability/freshness` — Update delays & data staleness
-  - `GET /api/observability/schema` — Source vs Target column differences & schema drift
+  - `GET /api/observability/volume` — Cartesian-safe source vs target row comparisons
+  - `GET /api/observability/freshness` — SLA tier breakdown (Fresh / Delayed / Stale)
+  - `GET /api/observability/schema` — Temporal schema drift events across runs
 
-- **Lineage & Logs:**
-  - `GET /api/lineage` — Graph nodes & edges (Source Assets -> Pipeline Transform Jobs -> Target Assets)
-  - `GET /api/logs` — Searchable & paginated pipeline run logs
-  - `GET /api/runs/{run_id}` — Single run deep-dive with asset metadata
-
-## Universal Filters
-
-Every endpoint supports the following query parameters:
-- `pipeline_name`, `pipeline_id`
-- `status` (`success`, `failed`, `error`, `running`)
-- `tool`
-- `start_date`, `end_date` (YYYY-MM-DD)
-- `start_time`, `end_time` (HH:MM:SS)
-- `system_name`, `database_name`, `schema_name`, `object_name`
-
-## Deployment on Vercel
-
-Configured via `vercel.json` and `api/index.py`. Set the following environment variables in Vercel:
-- `CENTRAL_DB_HOST`
-- `CENTRAL_DB_PORT`
-- `CENTRAL_DB_NAME`
-- `CENTRAL_DB_USER`
-- `CENTRAL_DB_PASSWORD`
+- **Lineage & Diagnostics:**
+  - `GET /api/lineage` — Deterministic data lineage graph
+  - `GET /api/logs` — Searchable execution logs & query traces
+  - `GET /api/runs/{run_id}` — Single run deep-dive with assets, columns, and query history
