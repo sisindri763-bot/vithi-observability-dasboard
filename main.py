@@ -86,6 +86,8 @@ def get_conn():
             user=USER,
             password=PASSWORD,
             database=DB_NAME,
+            charset="utf8mb4",
+            autocommit=True,
             cursorclass=pymysql.cursors.DictCursor,
             connect_timeout=10,
         )
@@ -106,7 +108,10 @@ def query(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
                 })
             return cleaned
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Universal Filter Builders
