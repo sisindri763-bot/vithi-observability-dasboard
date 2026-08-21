@@ -9,7 +9,7 @@ Production-grade Data Observability Backend REST API connected to AWS RDS MySQL 
 - **Blast Radius**: Computed dynamically from downstream datasets registered in `obs_run_assets` with `asset_role = 'TARGET'`.
 
 ### 2. SLA-Based Freshness
-- **Lag Metric**: `TIMESTAMPDIFF(MINUTE, last_updated_at, observed_at)`
+- **Lag Metric**: `TIMESTAMPDIFF(MINUTE, last_updated_at, UTC_TIMESTAMP())`
 - **SLA Classification**:
   - `Fresh`: $\text{lag} \le \text{SLA}$
   - `Delayed`: $\text{SLA} < \text{lag} \le 2 \times \text{SLA}$
@@ -52,6 +52,8 @@ Production-grade Data Observability Backend REST API connected to AWS RDS MySQL 
   - `GET /api/observability/volume` — Cartesian-safe source vs target row comparisons
   - `GET /api/observability/freshness` — SLA tier breakdown (Fresh / Delayed / Stale)
   - `GET /api/observability/schema` — Temporal schema drift events across runs
+  - `GET /api/observability/data-quality` — Query-backed data quality check results
+  - `GET /api/observability/metrics` — Calculated run metrics for dashboard consumers
 
 - **Lineage & Diagnostics:**
   - `GET /api/lineage` — Deterministic data lineage graph

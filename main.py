@@ -235,7 +235,11 @@ def build_asset_filters(
         clauses.append(f"{prefix}observed_at <= %s")
         params.append(end_dt)
 
-    if run_ids and isinstance(run_ids, (list, tuple)):
+    if run_ids is not None and isinstance(run_ids, (list, tuple)):
+        if not run_ids:
+            clauses.append("1 = 0")
+            where = "WHERE " + " AND ".join(clauses)
+            return where, tuple(params)
         placeholders = ",".join(["%s"] * len(run_ids))
         clauses.append(f"{prefix}run_id IN ({placeholders})")
         params.extend(run_ids)
@@ -256,6 +260,45 @@ def get_matching_run_ids(
     )
     rows = query(f"SELECT id FROM obs_pipeline_runs {where}", params)
     return [r["id"] for r in rows]
+
+
+def has_run_filters(
+    pipeline_name=None, pipeline_id=None, status=None, tool=None,
+    start_date=None, end_date=None, start_time=None, end_time=None,
+):
+    return any(value not in (None, "") for value in (
+        pipeline_name, pipeline_id, status, tool,
+        start_date, end_date, start_time, end_time,
+    ))
+
+
+def get_period_bounds(start_date=None, end_date=None, start_time=None, end_time=None):
+    if start_date or end_date:
+        start_value = f"{start_date} {start_time or '00:00:00'}" if start_date else None
+        end_value = f"{end_date} {end_time or '23:59:59'}" if end_date else None
+        start_dt = datetime.fromisoformat(start_value) if start_value else None
+        end_dt = datetime.fromisoformat(end_value) if end_value else datetime.now()
+        if start_dt is None:
+            start_dt = end_dt - timedelta(days=1)
+        return start_dt, end_dt
+
+    end_dt = datetime.now()
+    return end_dt - timedelta(days=1), end_dt
+
+
+def period_delta(current_value, previous_value):
+    if current_value is None or previous_value is None or previous_value == 0:
+        return None
+    return round(((current_value - previous_value) / abs(previous_value)) * 100, 1)
+
+
+def build_run_id_scope(column, run_ids, filtered):
+    if not filtered:
+        return "", ()
+    if not run_ids:
+        return " AND 1 = 0", ()
+    placeholders = ",".join(["%s"] * len(run_ids))
+    return f" AND {column} IN ({placeholders})", tuple(run_ids)
 
 # Standard Query Param Descriptions
 _PIPELINE_NAME_DESC = "Filter by pipeline name(s), comma-separated."
@@ -372,31 +415,54 @@ def get_overview_kpis(
         ) sub
         WHERE rn = 1
     """)
-    active_incidents_list = [p for p in latest_pipeline_status if str(p.get("status")).lower() in ('failed', 'error')]
+    scoped_pipeline_ids = None
+    if has_run_filters(pipeline_name, pipeline_id, status, tool, start_date, end_date, start_time, end_time):
+        scoped_pipeline_ids = {
+            row["pipeline_id"] for row in query(
+                f"SELECT DISTINCT pipeline_id FROM obs_pipeline_runs {where_runs}", params_runs
+            )
+        }
+    active_incidents_list = [
+        p for p in latest_pipeline_status
+        if str(p.get("status")).lower() in ('failed', 'error')
+        and (scoped_pipeline_ids is None or p.get("pipeline_id") in scoped_pipeline_ids)
+    ]
     active_incidents = len(active_incidents_list)
 
-    # 4. Period-over-Period Delta calculation (compare current window with previous window)
-    # If filtered by date range, compare with prior interval of same length. Otherwise compare last 7 days vs previous 7 days.
+    # 4. Period-over-Period Delta calculation for an explicitly selected window.
     delta_success_rate = None
     delta_duration = None
-    try:
-        prev_stats = query("""
+    if start_date and end_date:
+        try:
+            current_start, current_end = get_period_bounds(start_date, end_date, start_time, end_time)
+            period_length = current_end - current_start
+            previous_start = current_start - period_length
+            previous_end = current_start
+            previous_start_date = previous_start.strftime("%Y-%m-%d")
+            previous_end_date = previous_end.strftime("%Y-%m-%d")
+            previous_where, previous_params = build_run_filters(
+                pipeline_name=pipeline_name, pipeline_id=pipeline_id, status=status, tool=tool,
+                start_date=previous_start_date, end_date=previous_end_date,
+                start_time=previous_start.strftime("%H:%M:%S"), end_time=previous_end.strftime("%H:%M:%S"),
+            )
+            prev_stats = query(f"""
             SELECT 
                 COUNT(*) as total_runs,
                 SUM(CASE WHEN LOWER(status) IN ('success', 'succeeded') THEN 1 ELSE 0 END) as success_runs,
                 AVG(COALESCE(duration, 0)) as avg_duration
             FROM obs_pipeline_runs
-            WHERE start_time < (SELECT MIN(start_time) FROM (SELECT start_time FROM obs_pipeline_runs ORDER BY start_time DESC LIMIT 10) t)
-        """)
-        if prev_stats and prev_stats[0]["total_runs"] and prev_stats[0]["total_runs"] > 0:
-            p_total = int(prev_stats[0]["total_runs"])
-            p_succ  = int(prev_stats[0]["success_runs"] or 0)
-            p_dur   = float(prev_stats[0]["avg_duration"] or 0)
-            p_rate  = round((p_succ / p_total) * 100, 1)
-            delta_success_rate = round(success_rate - p_rate, 1)
-            delta_duration = round(avg_dur - p_dur, 1)
-    except Exception:
-        pass
+            {previous_where}
+            """, previous_params)
+            if prev_stats and prev_stats[0]["total_runs"] and prev_stats[0]["total_runs"] > 0:
+                p_total = int(prev_stats[0]["total_runs"])
+                p_succ  = int(prev_stats[0]["success_runs"] or 0)
+                p_dur   = float(prev_stats[0]["avg_duration"] or 0)
+                p_rate  = round((p_succ / p_total) * 100, 1)
+                delta_success_rate = round(success_rate - p_rate, 1)
+                delta_duration = round(avg_dur - p_dur, 1)
+        except (TypeError, ValueError):
+            delta_success_rate = None
+            delta_duration = None
 
     # Sparkline trend path from actual run durations
     spark_rows = query(f"""
@@ -580,17 +646,19 @@ def get_overview_health(
     where_a, params_a = build_asset_filters(
         system_name=system_name, database_name=database_name,
         schema_name=schema_name, object_name=object_name,
-        run_ids=run_ids if run_ids else None, alias="a",
+        run_ids=run_ids if (run_ids or has_run_filters(pipeline_name, pipeline_id, status, tool, start_date, end_date, start_time, end_time)) else None, alias="a",
     )
+    filtered_runs = has_run_filters(pipeline_name, pipeline_id, status, tool, start_date, end_date, start_time, end_time)
+    run_scope, run_scope_params = build_run_id_scope("run_id", run_ids, filtered_runs)
 
     # 1. Real Freshness: Evaluate actual lag vs SLA (60 min standard SLA)
     assets_fresh = query(f"""
         SELECT 
             COUNT(*) as total_assets,
-            SUM(CASE WHEN TIMESTAMPDIFF(MINUTE, last_updated_at, observed_at) <= 60 THEN 1 ELSE 0 END) as fresh_count,
-            SUM(CASE WHEN TIMESTAMPDIFF(MINUTE, last_updated_at, observed_at) > 60 AND TIMESTAMPDIFF(MINUTE, last_updated_at, observed_at) <= 180 THEN 1 ELSE 0 END) as delayed_count,
-            SUM(CASE WHEN TIMESTAMPDIFF(MINUTE, last_updated_at, observed_at) > 180 OR last_updated_at IS NULL THEN 1 ELSE 0 END) as stale_count,
-            AVG(TIMESTAMPDIFF(MINUTE, last_updated_at, observed_at)) as avg_lag_mins
+            SUM(CASE WHEN last_updated_at IS NOT NULL AND TIMESTAMPDIFF(MINUTE, last_updated_at, UTC_TIMESTAMP()) <= 60 THEN 1 ELSE 0 END) as fresh_count,
+            SUM(CASE WHEN last_updated_at IS NOT NULL AND TIMESTAMPDIFF(MINUTE, last_updated_at, UTC_TIMESTAMP()) > 60 AND TIMESTAMPDIFF(MINUTE, last_updated_at, UTC_TIMESTAMP()) <= 180 THEN 1 ELSE 0 END) as delayed_count,
+            SUM(CASE WHEN last_updated_at IS NOT NULL AND TIMESTAMPDIFF(MINUTE, last_updated_at, UTC_TIMESTAMP()) > 180 THEN 1 ELSE 0 END) as stale_count,
+            AVG(TIMESTAMPDIFF(MINUTE, last_updated_at, UTC_TIMESTAMP())) as avg_lag_mins
         FROM obs_run_assets a {where_a}
     """, params_a)
 
@@ -601,57 +669,62 @@ def get_overview_health(
     stale_cnt  = int(af.get("stale_count") or 0)
     avg_lag_m  = int(round(float(af.get("avg_lag_mins") or 0)))
 
-    freshness_score = round((fresh_cnt / tot_assets * 100), 1) if tot_assets > 0 else 100.0
+    freshness_score = round((fresh_cnt / (fresh_cnt + delayed_cnt + stale_cnt) * 100), 1) if (fresh_cnt + delayed_cnt + stale_cnt) > 0 else None
 
     # 2. Real Volume: Cartesian-safe aggregation (sum Source vs sum Target per run)
-    vol_runs = query("""
+    vol_runs = query(f"""
         SELECT 
             src.run_id,
             src.src_rows,
             tgt.tgt_rows,
             CASE WHEN src.src_rows > 0 AND tgt.tgt_rows < src.src_rows THEN (src.src_rows - tgt.tgt_rows) / src.src_rows ELSE 0 END as drop_pct
         FROM (
-            SELECT run_id, SUM(row_count) as src_rows FROM obs_run_assets WHERE asset_role = 'SOURCE' GROUP BY run_id
+            SELECT run_id, SUM(row_count) as src_rows FROM obs_run_assets WHERE asset_role = 'SOURCE'{run_scope} GROUP BY run_id
         ) src
         JOIN (
-            SELECT run_id, SUM(row_count) as tgt_rows FROM obs_run_assets WHERE asset_role = 'TARGET' GROUP BY run_id
+            SELECT run_id, SUM(row_count) as tgt_rows FROM obs_run_assets WHERE asset_role = 'TARGET'{run_scope} GROUP BY run_id
         ) tgt ON src.run_id = tgt.run_id
-    """)
+    """, run_scope_params + run_scope_params)
     total_vol_checks = len(vol_runs)
-    anomalous_vol_checks = sum(1 for v in vol_runs if float(v["drop_pct"] or 0) > 0.10)
-    volume_score = round(((total_vol_checks - anomalous_vol_checks) / total_vol_checks * 100), 1) if total_vol_checks > 0 else 100.0
+    anomalous_vol_checks = sum(1 for v in vol_runs if float(v["drop_pct"] or 0) > 0.15)
+    volume_score = round(((total_vol_checks - anomalous_vol_checks) / total_vol_checks * 100), 1) if total_vol_checks > 0 else None
 
     # 3. Real Schema: Count of runs with matching column counts and names
-    schema_runs = query("""
+    schema_runs = query(f"""
         SELECT 
             r.run_id,
             SUM(CASE WHEN r.asset_role = 'SOURCE' THEN 1 ELSE 0 END) as src_cols,
             SUM(CASE WHEN r.asset_role = 'TARGET' THEN 1 ELSE 0 END) as tgt_cols
         FROM obs_run_columns r
+        WHERE 1 = 1{run_scope.replace('run_id', 'r.run_id')}
         GROUP BY r.run_id
-    """)
+    """, run_scope_params)
     tot_schema_runs = len(schema_runs)
     matching_schema_runs = sum(1 for s in schema_runs if s["src_cols"] == s["tgt_cols"] and s["src_cols"] > 0)
-    schema_score = round((matching_schema_runs / tot_schema_runs * 100), 1) if tot_schema_runs > 0 else 100.0
+    schema_score = round((matching_schema_runs / tot_schema_runs * 100), 1) if tot_schema_runs > 0 else None
 
     # 4. Real Data Quality: Query execution success rate from obs_run_query_history
-    query_stats = query("""
+    query_stats = query(f"""
         SELECT 
             COUNT(*) as total_queries,
             SUM(CASE WHEN execution_status = 'SUCCESS' THEN 1 ELSE 0 END) as succ_queries,
             SUM(CASE WHEN execution_status LIKE 'FAILED%%' THEN 1 ELSE 0 END) as fail_queries
-        FROM obs_run_query_history
-    """)
+        FROM obs_run_query_history q
+        WHERE 1 = 1{run_scope.replace('run_id', 'q.run_id')}
+    """, run_scope_params)
     qs = query_stats[0] if query_stats else {}
     tot_q = int(qs.get("total_queries") or 0)
     succ_q = int(qs.get("succ_queries") or 0)
-    quality_score = round((succ_q / tot_q * 100), 1) if tot_q > 0 else 100.0
+    quality_score = round((succ_q / tot_q * 100), 1) if tot_q > 0 else None
 
     def get_status_label(score):
         if score is None: return "N/A"
         if score >= 90.0: return "Good"
         if score >= 75.0: return "Warning"
         return "Critical"
+
+    def format_score(score):
+        return f"{score}%" if score is not None else "N/A"
 
     return jsonify({
         "filters_applied": {
@@ -661,28 +734,28 @@ def get_overview_health(
         "pillars": [
             {
                 "name": "Freshness",
-                "score": f"{freshness_score}%",
+                "score": format_score(freshness_score),
                 "status": get_status_label(freshness_score),
                 "value": freshness_score,
                 "details": f"{fresh_cnt} Fresh, {delayed_cnt} Delayed, {stale_cnt} Stale (Avg lag: {avg_lag_m}m)"
             },
             {
                 "name": "Volume",
-                "score": f"{volume_score}%",
+                "score": format_score(volume_score),
                 "status": get_status_label(volume_score),
                 "value": volume_score,
                 "details": f"{total_vol_checks - anomalous_vol_checks}/{total_vol_checks} runs passed volume threshold"
             },
             {
                 "name": "Data Quality",
-                "score": f"{quality_score}%",
+                "score": format_score(quality_score),
                 "status": get_status_label(quality_score),
                 "value": quality_score,
                 "details": f"{succ_q}/{tot_q} queries compiled and executed successfully"
             },
             {
                 "name": "Schema",
-                "score": f"{schema_score}%",
+                "score": format_score(schema_score),
                 "status": get_status_label(schema_score),
                 "value": schema_score,
                 "details": f"{matching_schema_runs}/{tot_schema_runs} runs have zero schema mismatches"
@@ -733,7 +806,16 @@ def get_recent_incidents(
     - Identifies failed runs and determines if the incident is currently OPEN or RESOLVED
     - Includes blast radius (affected downstream datasets) and error severity
     """
-    effective_status = status if status else "failed,error"
+    requested_statuses = {value.strip().lower() for value in status.split(",")} if status else None
+    if requested_statuses and not requested_statuses.intersection({"failed", "error"}):
+        return jsonify({
+            "filters_applied": {"pipeline_name": pipeline_name, "status": status},
+            "total": 0,
+            "open_incidents": 0,
+            "resolved_incidents": 0,
+            "incidents": [],
+        })
+    effective_status = "failed,error"
     where_runs, params_runs = build_run_filters(
         pipeline_name=pipeline_name, pipeline_id=pipeline_id,
         status=effective_status, tool=tool,
@@ -743,7 +825,7 @@ def get_recent_incidents(
 
     lim = int(limit) if isinstance(limit, (int, str)) and str(limit).isdigit() else 10
 
-    # Get failed runs
+    # Consecutive failures belong to one incident per pipeline.
     rows = query(f"""
         SELECT 
             id, pipeline_id, pipeline_name, status, tool_name,
@@ -752,8 +834,12 @@ def get_recent_incidents(
             created_at
         FROM obs_pipeline_runs {where_runs}
         ORDER BY COALESCE(start_time, created_at) DESC
-        LIMIT %s
-    """, params_runs + (lim,))
+    """, params_runs)
+
+    latest_failure_by_pipeline = {}
+    for row in rows:
+        latest_failure_by_pipeline.setdefault(row["pipeline_id"], row)
+    rows = list(latest_failure_by_pipeline.values())[:lim]
 
     # Determine latest status per pipeline to mark incidents as OPEN vs RESOLVED
     latest_statuses = query("""
@@ -1001,11 +1087,19 @@ def get_volume_observability(
         start_time=start_time, end_time=end_time,
     )
 
+    asset_run_ids = run_ids if (run_ids or has_run_filters(pipeline_name, pipeline_id, status, tool, start_date, end_date, start_time, end_time)) else None
     where_src, params_src = build_asset_filters(
         system_name=system_name, database_name=database_name,
         schema_name=schema_name, object_name=object_name,
-        run_ids=run_ids if run_ids else None, alias="s",
+        run_ids=asset_run_ids, alias="s",
     )
+    where_tgt, params_tgt = build_asset_filters(
+        system_name=system_name, database_name=database_name,
+        schema_name=schema_name, object_name=object_name,
+        run_ids=asset_run_ids, alias="t",
+    )
+    source_scope = where_src.replace("WHERE ", "WHERE s.asset_role = 'SOURCE' AND ", 1) if where_src else "WHERE s.asset_role = 'SOURCE'"
+    target_scope = where_tgt.replace("WHERE ", "WHERE t.asset_role = 'TARGET' AND ", 1) if where_tgt else "WHERE t.asset_role = 'TARGET'"
 
     # Pre-aggregated source & target CTEs to guarantee 1:1 join per run_id
     rows = query(f"""
@@ -1023,7 +1117,7 @@ def get_volume_observability(
                 SUM(s.row_count) as src_rows, SUM(s.size_bytes) as src_bytes,
                 MAX(s.observed_at) as src_observed_at
             FROM obs_run_assets s
-            WHERE s.asset_role = 'SOURCE'
+            {source_scope}
             GROUP BY s.run_id
         ) src
         JOIN (
@@ -1033,11 +1127,11 @@ def get_volume_observability(
                 MAX(t.schema_name) as tgt_schema, MAX(t.object_name) as tgt_object,
                 SUM(t.row_count) as tgt_rows, SUM(t.size_bytes) as tgt_bytes
             FROM obs_run_assets t
-            WHERE t.asset_role = 'TARGET'
+            {target_scope}
             GROUP BY t.run_id
         ) tgt ON src.run_id = tgt.run_id
         ORDER BY src.src_observed_at DESC
-    """)
+    """, params_src + params_tgt)
 
     result = []
     for r in rows:
@@ -1104,14 +1198,14 @@ def get_freshness_observability(
     where_a, params_a = build_asset_filters(
         system_name=system_name, database_name=database_name,
         schema_name=schema_name, object_name=object_name,
-        run_ids=run_ids if run_ids else None, alias="a",
+        run_ids=run_ids if (run_ids or has_run_filters(pipeline_name, pipeline_id, status, tool, start_date, end_date, start_time, end_time)) else None, alias="a",
     )
 
     rows = query(f"""
         SELECT 
             a.id, a.run_id, a.asset_role, a.system_name, a.database_name, a.schema_name, a.object_name,
             a.dataset_id, a.last_updated_at, a.observed_at,
-            TIMESTAMPDIFF(MINUTE, a.last_updated_at, a.observed_at) as lag_minutes
+            TIMESTAMPDIFF(MINUTE, a.last_updated_at, UTC_TIMESTAMP()) as lag_minutes
         FROM obs_run_assets a {where_a}
         ORDER BY a.observed_at DESC
     """, params_a)
@@ -1122,8 +1216,10 @@ def get_freshness_observability(
     stale_cnt = 0
 
     for r in rows:
-        lag_m = int(r["lag_minutes"] or 0)
-        if lag_m <= sla_minutes:
+        lag_m = int(r["lag_minutes"]) if r["lag_minutes"] is not None else None
+        if lag_m is None or sla_minutes <= 0:
+            freshness_state = None
+        elif lag_m <= sla_minutes:
             freshness_state = "Fresh"
             fresh_cnt += 1
         elif lag_m <= (sla_minutes * 2):
@@ -1144,7 +1240,7 @@ def get_freshness_observability(
             "lag_minutes": lag_m,
             "sla_minutes": sla_minutes,
             "sla_status": freshness_state,
-            "is_breached": freshness_state != "Fresh"
+            "is_breached": freshness_state is not None and freshness_state != "Fresh"
         })
 
     total = len(result)
@@ -1155,7 +1251,7 @@ def get_freshness_observability(
             "fresh_count": fresh_cnt,
             "delayed_count": delayed_cnt,
             "stale_count": stale_cnt,
-            "compliance_rate": f"{round(fresh_cnt / max(1, total) * 100, 1)}%"
+            "compliance_rate": f"{round(fresh_cnt / (fresh_cnt + delayed_cnt + stale_cnt) * 100, 1)}%" if (fresh_cnt + delayed_cnt + stale_cnt) else None
         },
         "freshness_checks": result
     })
@@ -1166,6 +1262,14 @@ def get_freshness_observability(
 
 @app.get("/api/observability/schema", tags=["Data Observability"], summary="Column-Level Temporal Schema Drift")
 def get_schema_observability(
+    pipeline_name: Optional[str] = Query(None, description=_PIPELINE_NAME_DESC),
+    pipeline_id:   Optional[str] = Query(None, description=_PIPELINE_ID_DESC),
+    status:        Optional[str] = Query(None, description=_STATUS_DESC),
+    tool:          Optional[str] = Query(None, description=_TOOL_DESC),
+    start_date:    Optional[str] = Query(None, description=_START_DATE_DESC),
+    end_date:      Optional[str] = Query(None, description=_END_DATE_DESC),
+    start_time:    Optional[str] = Query(None, description=_START_TIME_DESC),
+    end_time:      Optional[str] = Query(None, description=_END_TIME_DESC),
     dataset_id:    Optional[str] = Query(None, description="Specific dataset_id to trace drift over time"),
     database_name: Optional[str] = Query(None, description=_DB_NAME_DESC),
     schema_name:   Optional[str] = Query(None, description=_SCHEMA_NAME_DESC),
@@ -1175,12 +1279,34 @@ def get_schema_observability(
     Traces temporal schema drift across consecutive runs for each dataset.
     Compares Run(N) columns against Run(N-1) columns to detect added/dropped columns and type migrations.
     """
-    cols = query("""
+    schema_run_ids = get_matching_run_ids(
+        pipeline_name=pipeline_name, pipeline_id=pipeline_id, status=status, tool=tool,
+        start_date=start_date, end_date=end_date, start_time=start_time, end_time=end_time,
+    )
+    schema_filtered = has_run_filters(pipeline_name, pipeline_id, status, tool, start_date, end_date, start_time, end_time)
+    schema_scope, schema_params = build_run_id_scope("run_id", schema_run_ids, schema_filtered)
+    dataset_scope = ""
+    dataset_params = []
+    if dataset_id:
+        dataset_scope = " AND dataset_id = %s"
+        dataset_params.append(dataset_id)
+    if database_name:
+        dataset_scope += " AND database_name = %s"
+        dataset_params.append(database_name)
+    if schema_name:
+        dataset_scope += " AND schema_name = %s"
+        dataset_params.append(schema_name)
+    if object_name:
+        dataset_scope += " AND object_name = %s"
+        dataset_params.append(object_name)
+
+    cols = query(f"""
         SELECT 
             run_id, dataset_id, database_name, schema_name, object_name, column_name, data_type, ordinal_position, created_at
         FROM obs_run_columns
+        WHERE 1 = 1{schema_scope}{dataset_scope}
         ORDER BY dataset_id, created_at ASC, ordinal_position ASC
-    """)
+    """, schema_params + tuple(dataset_params))
 
     # Group columns by dataset_id -> run_id -> column list
     by_ds_run: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
@@ -1247,10 +1373,30 @@ def get_data_lineage(
     Generates deterministic data lineage graph from registered pipeline configs and executed run assets:
     Source Asset (Snowflake/MySQL) -> Pipeline (dbt Job) -> Target Warehouse Dataset
     """
-    pipelines = query("SELECT pipeline_id, pipeline_name, source_tool, etl_tool, target_tool, is_active, config_json FROM obs_pipelines")
+    pipeline_clauses = []
+    pipeline_params = []
+    if pipeline_id:
+        ids = [value.strip() for value in pipeline_id.split(",") if value.strip()]
+        pipeline_clauses.append("pipeline_id IN (" + ",".join(["%s"] * len(ids)) + ")")
+        pipeline_params.extend(ids)
+    if pipeline_name:
+        names = [value.strip() for value in pipeline_name.split(",") if value.strip()]
+        pipeline_clauses.append("pipeline_name IN (" + ",".join(["%s"] * len(names)) + ")")
+        pipeline_params.extend(names)
+    pipeline_where = " WHERE " + " AND ".join(pipeline_clauses) if pipeline_clauses else ""
+    pipelines = query(f"SELECT pipeline_id, pipeline_name, source_tool, etl_tool, target_tool, is_active, config_json FROM obs_pipelines{pipeline_where}", tuple(pipeline_params))
+    selected_pipeline_ids = [p["pipeline_id"] for p in pipelines]
     
     # Query distinct assets linked directly via pipeline runs
-    pipeline_assets = query("""
+    asset_scope = ""
+    asset_params = []
+    if pipeline_clauses:
+        if selected_pipeline_ids:
+            asset_scope = " WHERE r.pipeline_id IN (" + ",".join(["%s"] * len(selected_pipeline_ids)) + ")"
+            asset_params.extend(selected_pipeline_ids)
+        else:
+            asset_scope = " WHERE 1 = 0"
+    pipeline_assets = query(f"""
         SELECT DISTINCT 
             r.pipeline_id,
             a.asset_role,
@@ -1261,10 +1407,10 @@ def get_data_lineage(
             a.dataset_id,
             a.row_count
         FROM obs_pipeline_runs r
-        JOIN obs_run_assets a ON r.id = a.run_id
-    """)
+        JOIN obs_run_assets a ON r.id = a.run_id{asset_scope}
+    """, tuple(asset_params))
 
-    nodes, edges, seen_nodes = [], [], set()
+    nodes, edges, seen_nodes, seen_edges = [], [], set(), set()
 
     def add_node(nid, ntype, label, metadata=None):
         if nid not in seen_nodes:
@@ -1296,9 +1442,15 @@ def get_data_lineage(
         )
 
         if role == "SOURCE":
-            edges.append({"from": node_id, "to": pipe_node_id, "label": "feeds"})
+            edge = (node_id, pipe_node_id, "feeds")
+            if edge not in seen_edges:
+                seen_edges.add(edge)
+                edges.append({"from": node_id, "to": pipe_node_id, "label": "feeds"})
         else:
-            edges.append({"from": pipe_node_id, "to": node_id, "label": "populates"})
+            edge = (pipe_node_id, node_id, "populates")
+            if edge not in seen_edges:
+                seen_edges.add(edge)
+                edges.append({"from": pipe_node_id, "to": node_id, "label": "populates"})
 
     return jsonify({
         "total_nodes": len(nodes),
@@ -1308,7 +1460,83 @@ def get_data_lineage(
     })
 
 # =============================================================================
-# 12. LOGS & QUERY HISTORY EXPLORER
+# 12. DATA QUALITY CHECKS
+# =============================================================================
+
+@app.get("/api/observability/data-quality", tags=["Data Observability"], summary="Data Quality Check Results")
+def get_data_quality(
+    pipeline_name: Optional[str] = Query(None, description=_PIPELINE_NAME_DESC),
+    pipeline_id:   Optional[str] = Query(None, description=_PIPELINE_ID_DESC),
+    status:        Optional[str] = Query(None, description=_STATUS_DESC),
+    tool:          Optional[str] = Query(None, description=_TOOL_DESC),
+    start_date:    Optional[str] = Query(None, description=_START_DATE_DESC),
+    end_date:      Optional[str] = Query(None, description=_END_DATE_DESC),
+    start_time:    Optional[str] = Query(None, description=_START_TIME_DESC),
+    end_time:      Optional[str] = Query(None, description=_END_TIME_DESC),
+    limit:         int = Query(100, description="Max checks to return"),
+):
+    where_runs, params_runs = build_run_filters(
+        pipeline_name=pipeline_name, pipeline_id=pipeline_id, status=status, tool=tool,
+        start_date=start_date, end_date=end_date, start_time=start_time, end_time=end_time,
+        alias="r",
+    )
+    rows = query(f"""
+        SELECT q.*, r.pipeline_id, r.pipeline_name, r.status AS run_status
+        FROM obs_run_query_history q
+        JOIN obs_pipeline_runs r ON r.id = q.run_id
+        {where_runs}
+        ORDER BY COALESCE(r.start_time, r.created_at) DESC
+        LIMIT %s
+    """, params_runs + (max(1, min(int(limit), 1000)),))
+    passed = sum(1 for row in rows if str(row.get("execution_status") or "").upper() == "SUCCESS")
+    failed = len(rows) - passed
+    return jsonify({
+        "filters_applied": {"pipeline_name": pipeline_name, "pipeline_id": pipeline_id, "start_date": start_date, "end_date": end_date},
+        "summary": {
+            "total_checks": len(rows),
+            "passed_checks": passed,
+            "failed_checks": failed,
+            "pass_rate": round(passed / len(rows) * 100, 1) if rows else None,
+        },
+        "checks": rows,
+    })
+
+
+@app.get("/api/observability/metrics", tags=["Data Observability"], summary="Calculated Observability Metrics")
+def get_observability_metrics(
+    pipeline_name: Optional[str] = Query(None, description=_PIPELINE_NAME_DESC),
+    pipeline_id:   Optional[str] = Query(None, description=_PIPELINE_ID_DESC),
+    status:        Optional[str] = Query(None, description=_STATUS_DESC),
+    tool:          Optional[str] = Query(None, description=_TOOL_DESC),
+    start_date:    Optional[str] = Query(None, description=_START_DATE_DESC),
+    end_date:      Optional[str] = Query(None, description=_END_DATE_DESC),
+):
+    where_runs, params_runs = build_run_filters(
+        pipeline_name=pipeline_name, pipeline_id=pipeline_id, status=status, tool=tool,
+        start_date=start_date, end_date=end_date,
+    )
+    stats = query(f"""
+        SELECT COUNT(*) AS total_runs,
+               SUM(CASE WHEN LOWER(status) IN ('success', 'succeeded') THEN 1 ELSE 0 END) AS successful_runs,
+               SUM(CASE WHEN LOWER(status) IN ('failed', 'error') THEN 1 ELSE 0 END) AS failed_runs,
+               AVG(duration) AS average_duration_seconds
+        FROM obs_pipeline_runs {where_runs}
+    """, params_runs)[0]
+    total_runs = int(stats.get("total_runs") or 0)
+    successful_runs = int(stats.get("successful_runs") or 0)
+    return jsonify({
+        "filters_applied": {"pipeline_name": pipeline_name, "pipeline_id": pipeline_id, "start_date": start_date, "end_date": end_date},
+        "runs": {
+            "total": total_runs,
+            "successful": successful_runs,
+            "failed": int(stats.get("failed_runs") or 0),
+            "success_rate": round(successful_runs / total_runs * 100, 1) if total_runs else None,
+            "average_duration_seconds": round(float(stats.get("average_duration_seconds") or 0), 1) if total_runs else None,
+        },
+    })
+
+# =============================================================================
+# 13. LOGS & QUERY HISTORY EXPLORER
 # =============================================================================
 
 @app.get("/api/logs", tags=["Logs"], summary="Searchable Execution Logs")
